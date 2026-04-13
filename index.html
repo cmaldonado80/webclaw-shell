@@ -135,11 +135,16 @@
   // ── State ──
   let ws = null;
   let password = sessionStorage.getItem('wc_pass') || '';
+  let deviceToken = sessionStorage.getItem('wc_device_token') || '';
   let reconnectDelay = 1000;
   let reconnectTimer = null;
   let inputBuffer = '';
   let awaitingPassword = false;
   let connected = false;
+  let connectNonce = null;
+  let reqCounter = 0;
+
+  function nextReqId() { return 'shell_' + (++reqCounter) + '_' + Date.now(); }
 
   // ── Banner & Auth Flow ──
   function showBanner() {
@@ -151,7 +156,6 @@
   function promptPassword() {
     awaitingPassword = true;
     inputBuffer = '';
-    term.writeln('\x1b[38;2;78;205;196mConnecting to main.mghm.ai...\x1b[0m');
     term.write('\x1b[38;2;255;138;92mPassword: \x1b[0m');
   }
 
@@ -175,6 +179,50 @@
     }
   }
 
+  // ── OpenClaw Protocol: connect request ──
+  function sendConnectRequest() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const authPayload = {};
+    if (deviceToken) {
+      authPayload.deviceToken = deviceToken;
+    }
+    if (password) {
+      authPayload.password = password;
+    }
+    const connectReq = {
+      type: 'req',
+      id: nextReqId(),
+      method: 'connect',
+      params: {
+        minProtocol: 3,
+        maxProtocol: 3,
+        client: {
+          id: 'webclaw-shell',
+          version: '1.0.0',
+          platform: 'browser',
+          mode: 'operator',
+        },
+        role: 'operator',
+        scopes: ['*'],
+        auth: authPayload,
+        device: {
+          id: getDeviceId(),
+          nonce: connectNonce,
+        },
+      },
+    };
+    ws.send(JSON.stringify(connectReq));
+  }
+
+  function getDeviceId() {
+    let id = sessionStorage.getItem('wc_device_id');
+    if (!id) {
+      id = 'shell_' + crypto.randomUUID();
+      sessionStorage.setItem('wc_device_id', id);
+    }
+    return id;
+  }
+
   // ── WebSocket ──
   function connectWS() {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -191,7 +239,7 @@
 
     ws.onopen = function () {
       reconnectDelay = 1000;
-      ws.send(JSON.stringify({ type: 'auth', password: password }));
+      // Wait for connect.challenge from server — don't send anything yet
     };
 
     ws.onmessage = function (event) {
@@ -201,22 +249,69 @@
         return;
       }
 
-      if (msg.type === 'auth_success') {
-        connected = true;
-        term.writeln('\x1b[1;38;2;78;205;196mConnected to WebClaw Gateway \u2705\x1b[0m');
-        term.writeln("\x1b[38;2;102;102;119mType 'help' for available commands.\x1b[0m");
-        term.writeln('');
-        term.write('\x1b[38;2;78;205;196m\u276f \x1b[0m');
-      } else if (msg.type === 'auth_fail') {
-        term.writeln('\x1b[38;2;255;107;107mAuthentication failed.\x1b[0m');
-        sessionStorage.removeItem('wc_pass');
-        password = '';
-        promptPassword();
-      } else if (msg.type === 'output') {
+      // ── Event frames ──
+      if (msg.type === 'event') {
+        if (msg.event === 'connect.challenge') {
+          // Server challenge — extract nonce and send connect request
+          connectNonce = msg.payload && msg.payload.nonce ? msg.payload.nonce : null;
+          if (connectNonce) {
+            if (password || deviceToken) {
+              sendConnectRequest();
+            } else {
+              promptPassword();
+            }
+          } else {
+            term.writeln('\x1b[38;2;255;107;107mInvalid challenge from server.\x1b[0m');
+          }
+          return;
+        }
+        // Forward other events to terminal
+        if (msg.event && msg.payload) {
+          term.writeln('\x1b[38;2;102;102;119m[' + msg.event + ']\x1b[0m');
+        }
+        return;
+      }
+
+      // ── Response frames (to our requests) ──
+      if (msg.type === 'res') {
+        if (msg.ok && msg.payload && msg.payload.type === 'hello-ok') {
+          // Auth success
+          connected = true;
+          if (msg.payload.auth && msg.payload.auth.deviceToken) {
+            deviceToken = msg.payload.auth.deviceToken;
+            sessionStorage.setItem('wc_device_token', deviceToken);
+          }
+          term.writeln('\x1b[1;38;2;78;205;196mConnected to WebClaw Gateway \u2705\x1b[0m');
+          const proto = msg.payload.protocol ? ' (protocol v' + msg.payload.protocol + ')' : '';
+          term.writeln('\x1b[38;2;102;102;119mSession established' + proto + '\x1b[0m');
+          term.writeln("\x1b[38;2;102;102;119mType 'help' for available commands.\x1b[0m");
+          term.writeln('');
+          term.write('\x1b[38;2;78;205;196m\u276f \x1b[0m');
+          return;
+        }
+        if (!msg.ok) {
+          // Auth or request failure
+          const errMsg = (msg.payload && msg.payload.message) || (msg.payload && msg.payload.code) || 'unknown error';
+          term.writeln('\x1b[38;2;255;107;107mServer rejected: ' + errMsg + '\x1b[0m');
+          if (errMsg.includes('auth') || errMsg.includes('password') || errMsg.includes('denied') || errMsg.includes('invalid')) {
+            sessionStorage.removeItem('wc_pass');
+            sessionStorage.removeItem('wc_device_token');
+            password = '';
+            deviceToken = '';
+            promptPassword();
+          }
+          return;
+        }
+        return;
+      }
+
+      // ── Output / prompt frames ──
+      if (msg.type === 'output') {
         term.write(msg.data);
       } else if (msg.type === 'prompt') {
         term.write('\x1b[38;2;78;205;196m\u276f \x1b[0m');
       } else {
+        // Unknown frame — show raw
         term.write(event.data);
       }
     };
@@ -227,6 +322,7 @@
 
     ws.onclose = function (event) {
       connected = false;
+      connectNonce = null;
       if (!event.wasClean) {
         term.writeln('\x1b[38;2;255;107;107mConnection lost.\x1b[0m');
         scheduleReconnect();
@@ -240,7 +336,7 @@
     term.writeln('\x1b[38;2;102;102;119mReconnecting in ' + (delay / 1000) + 's...\x1b[0m');
     reconnectTimer = setTimeout(function () {
       reconnectDelay *= 2;
-      if (password) {
+      if (password || deviceToken) {
         connectWS();
       } else {
         promptPassword();
@@ -426,12 +522,8 @@
 
   // ── Boot ──
   showBanner();
-  if (password) {
-    term.writeln('\x1b[38;2;102;102;119mRestoring session...\x1b[0m');
-    connectWS();
-  } else {
-    promptPassword();
-  }
+  term.writeln('\x1b[38;2;78;205;196mConnecting to main.mghm.ai...\x1b[0m');
+  connectWS();
 
 })();
 </script>
