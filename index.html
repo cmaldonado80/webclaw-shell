@@ -197,30 +197,16 @@
         minProtocol: 3,
         maxProtocol: 3,
         client: {
-          id: 'webclaw-shell',
+          id: 'webchat-ui',
           version: '1.0.0',
-          platform: 'browser',
-          mode: 'operator',
+          platform: navigator.platform || 'browser',
+          mode: 'ui',
         },
         role: 'operator',
-        scopes: ['*'],
         auth: authPayload,
-        device: {
-          id: getDeviceId(),
-          nonce: connectNonce,
-        },
       },
     };
     ws.send(JSON.stringify(connectReq));
-  }
-
-  function getDeviceId() {
-    let id = sessionStorage.getItem('wc_device_id');
-    if (!id) {
-      id = 'shell_' + crypto.randomUUID();
-      sessionStorage.setItem('wc_device_id', id);
-    }
-    return id;
   }
 
   // ── WebSocket ──
