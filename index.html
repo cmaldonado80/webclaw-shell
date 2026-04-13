@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebClaw Shell</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#0a0a1a;--bar:#16213e;--panel:#1a1a2e;
+    --red:#ff6b6b;--teal:#4ecdc4;--coral:#ff8a5c;--text:#e0e0e0;--dim:#667;
+    --bar-h:48px;
+  }
+  html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+
+  /* STATUS BAR */
+  #status-bar{
+    height:var(--bar-h);display:flex;align-items:center;justify-content:space-between;
+    padding:0 16px;background:var(--bar);border-bottom:1px solid #ffffff10;
+    font-size:13px;gap:12px;flex-shrink:0;
+  }
+  #status-bar .brand{font-weight:700;font-size:15px;white-space:nowrap}
+  #status-bar .indicators{display:flex;align-items:center;gap:16px;flex-wrap:wrap;justify-content:center}
+  #status-bar .info{display:flex;align-items:center;gap:16px;white-space:nowrap}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+  .dot.green{background:#4ecdc4;box-shadow:0 0 6px #4ecdc488}
+  .dot.red{background:#ff6b6b;box-shadow:0 0 6px #ff6b6b88}
+  .indicator{display:flex;align-items:center;gap:2px}
+
+  /* CONTENT AREA */
+  #content{display:flex;height:calc(100% - var(--bar-h));overflow:hidden}
+
+  /* TERMINAL PANEL */
+  #terminal-panel{
+    flex:0 0 60%;min-width:200px;
+    background:var(--panel);position:relative;overflow:hidden;
+    display:flex;flex-direction:column;
+  }
+  #terminal-container{flex:1;padding:4px}
+
+  /* RESIZER */
+  #resizer{
+    width:4px;cursor:col-resize;background:transparent;flex-shrink:0;
+    transition:background .2s;position:relative;z-index:10;
+  }
+  #resizer:hover,#resizer.active{background:var(--teal)}
+
+  /* CHAT PANEL */
+  #chat-panel{flex:1;min-width:200px;background:var(--panel);overflow:hidden}
+  #chat-panel iframe{width:100%;height:100%;border:none}
+
+  /* MOBILE */
+  @media(max-width:768px){
+    #content{flex-direction:column}
+    #terminal-panel{flex:0 0 50%;min-width:unset;min-height:200px}
+    #resizer{width:100%;height:4px;cursor:row-resize}
+    #chat-panel{min-width:unset;min-height:200px}
+    #status-bar{padding:0 8px;font-size:11px;gap:6px}
+    #status-bar .info{gap:8px}
+  }
+</style>
+</head>
+<body>
+
+<!-- STATUS BAR -->
+<div id="status-bar">
+  <div class="brand">&#x1F99E; WebClaw Shell</div>
+  <div class="indicators">
+    <span class="indicator" id="gw-status"><span class="dot red"></span>Gateway</span>
+    <span class="indicator" id="mac-status"><span class="dot red"></span>Mac</span>
+  </div>
+  <div class="info">
+    <span id="model-info">Model: --</span>
+    <span id="session-info">Sessions: --</span>
+    <span id="clock"></span>
+  </div>
+</div>
+
+<!-- CONTENT -->
+<div id="content">
+  <div id="terminal-panel">
+    <div id="terminal-container"></div>
+  </div>
+  <div id="resizer"></div>
+  <div id="chat-panel">
+    <iframe src="https://main.mghm.ai/chat?session=main" allow="clipboard-read; clipboard-write"></iframe>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ── Terminal Setup ──
+  const term = new window.Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", monospace',
+    theme: {
+      background: '#1a1a2e',
+      foreground: '#e0e0e0',
+      cursor: '#ff6b6b',
+      cursorAccent: '#1a1a2e',
+      selectionBackground: '#4ecdc440',
+      black: '#1a1a2e',
+      red: '#ff6b6b',
+      green: '#4ecdc4',
+      yellow: '#ff8a5c',
+      blue: '#5b86e5',
+      magenta: '#c471ed',
+      cyan: '#4ecdc4',
+      white: '#e0e0e0',
+      brightBlack: '#667',
+      brightRed: '#ff8a8a',
+      brightGreen: '#7eddd4',
+      brightYellow: '#ffab8a',
+      brightBlue: '#8aabf0',
+      brightMagenta: '#d9a0f0',
+      brightCyan: '#7eddd4',
+      brightWhite: '#ffffff',
+    },
+  });
+
+  const fitAddon = new window.FitAddon.FitAddon();
+  const webLinksAddon = new window.WebLinksAddon.WebLinksAddon();
+  term.loadAddon(fitAddon);
+  term.loadAddon(webLinksAddon);
+  term.open(document.getElementById('terminal-container'));
+  fitAddon.fit();
+
+  // ── State ──
+  let ws = null;
+  let password = sessionStorage.getItem('wc_pass') || '';
+  let reconnectDelay = 1000;
+  let reconnectTimer = null;
+  let inputBuffer = '';
+  let awaitingPassword = false;
+  let connected = false;
+
+  // ── Banner & Auth Flow ──
+  function showBanner() {
+    term.writeln('\x1b[1;38;2;255;107;107m\u{1F99E} WebClaw Shell v1.0\x1b[0m');
+    term.writeln('\x1b[38;2;102;102;119m─────────────────────────────\x1b[0m');
+    term.writeln('');
+  }
+
+  function promptPassword() {
+    awaitingPassword = true;
+    inputBuffer = '';
+    term.writeln('\x1b[38;2;78;205;196mConnecting to main.mghm.ai...\x1b[0m');
+    term.write('\x1b[38;2;255;138;92mPassword: \x1b[0m');
+  }
+
+  function handlePasswordInput(data) {
+    for (const ch of data) {
+      if (ch === '\r' || ch === '\n') {
+        term.writeln('');
+        password = inputBuffer;
+        sessionStorage.setItem('wc_pass', password);
+        inputBuffer = '';
+        awaitingPassword = false;
+        connectWS();
+        return;
+      } else if (ch === '\x7f' || ch === '\b') {
+        if (inputBuffer.length > 0) {
+          inputBuffer = inputBuffer.slice(0, -1);
+        }
+      } else if (ch >= ' ') {
+        inputBuffer += ch;
+      }
+    }
+  }
+
+  // ── WebSocket ──
+  function connectWS() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+    term.writeln('\x1b[38;2;102;102;119mOpening WebSocket...\x1b[0m');
+
+    try {
+      ws = new WebSocket('wss://main.mghm.ai');
+    } catch (e) {
+      term.writeln('\x1b[38;2;255;107;107mFailed to create WebSocket: ' + e.message + '\x1b[0m');
+      scheduleReconnect();
+      return;
+    }
+
+    ws.onopen = function () {
+      reconnectDelay = 1000;
+      ws.send(JSON.stringify({ type: 'auth', password: password }));
+    };
+
+    ws.onmessage = function (event) {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) {
+        term.write(event.data);
+        return;
+      }
+
+      if (msg.type === 'auth_success') {
+        connected = true;
+        term.writeln('\x1b[1;38;2;78;205;196mConnected to WebClaw Gateway \u2705\x1b[0m');
+        term.writeln("\x1b[38;2;102;102;119mType 'help' for available commands.\x1b[0m");
+        term.writeln('');
+        term.write('\x1b[38;2;78;205;196m\u276f \x1b[0m');
+      } else if (msg.type === 'auth_fail') {
+        term.writeln('\x1b[38;2;255;107;107mAuthentication failed.\x1b[0m');
+        sessionStorage.removeItem('wc_pass');
+        password = '';
+        promptPassword();
+      } else if (msg.type === 'output') {
+        term.write(msg.data);
+      } else if (msg.type === 'prompt') {
+        term.write('\x1b[38;2;78;205;196m\u276f \x1b[0m');
+      } else {
+        term.write(event.data);
+      }
+    };
+
+    ws.onerror = function () {
+      term.writeln('\x1b[38;2;255;107;107mWebSocket error.\x1b[0m');
+    };
+
+    ws.onclose = function (event) {
+      connected = false;
+      if (!event.wasClean) {
+        term.writeln('\x1b[38;2;255;107;107mConnection lost.\x1b[0m');
+        scheduleReconnect();
+      }
+    };
+  }
+
+  function scheduleReconnect() {
+    clearTimeout(reconnectTimer);
+    const delay = Math.min(reconnectDelay, 30000);
+    term.writeln('\x1b[38;2;102;102;119mReconnecting in ' + (delay / 1000) + 's...\x1b[0m');
+    reconnectTimer = setTimeout(function () {
+      reconnectDelay *= 2;
+      if (password) {
+        connectWS();
+      } else {
+        promptPassword();
+      }
+    }, delay);
+  }
+
+  // ── Terminal Input ──
+  let cmdBuffer = '';
+
+  term.onData(function (data) {
+    if (awaitingPassword) {
+      handlePasswordInput(data);
+      return;
+    }
+
+    if (!connected) return;
+
+    for (const ch of data) {
+      if (ch === '\r') {
+        term.writeln('');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input', data: cmdBuffer }));
+        }
+        cmdBuffer = '';
+      } else if (ch === '\x7f' || ch === '\b') {
+        if (cmdBuffer.length > 0) {
+          cmdBuffer = cmdBuffer.slice(0, -1);
+          term.write('\b \b');
+        }
+      } else if (ch === '\x03') {
+        // Ctrl+C
+        cmdBuffer = '';
+        term.writeln('^C');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'signal', signal: 'SIGINT' }));
+        }
+        term.write('\x1b[38;2;78;205;196m\u276f \x1b[0m');
+      } else if (ch >= ' ') {
+        cmdBuffer += ch;
+        term.write(ch);
+      }
+    }
+  });
+
+  // ── Resize ──
+  window.addEventListener('resize', function () { fitAddon.fit(); });
+  new ResizeObserver(function () { fitAddon.fit(); }).observe(document.getElementById('terminal-container'));
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+  }
+  term.onResize(function (size) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows }));
+    }
+  });
+
+  // ── Panel Resizer ──
+  (function () {
+    const resizer = document.getElementById('resizer');
+    const termPanel = document.getElementById('terminal-panel');
+    const content = document.getElementById('content');
+    let dragging = false;
+
+    resizer.addEventListener('mousedown', function (e) {
+      dragging = true;
+      resizer.classList.add('active');
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', function (e) {
+      if (!dragging) return;
+      const rect = content.getBoundingClientRect();
+      const isMobile = window.innerWidth <= 768;
+      if (isMobile) {
+        const pct = ((e.clientY - rect.top) / rect.height) * 100;
+        termPanel.style.flex = '0 0 ' + Math.max(20, Math.min(80, pct)) + '%';
+      } else {
+        const pct = ((e.clientX - rect.left) / rect.width) * 100;
+        termPanel.style.flex = '0 0 ' + Math.max(20, Math.min(80, pct)) + '%';
+      }
+      fitAddon.fit();
+    });
+
+    document.addEventListener('mouseup', function () {
+      if (dragging) {
+        dragging = false;
+        resizer.classList.remove('active');
+      }
+    });
+
+    // Touch support
+    resizer.addEventListener('touchstart', function (e) {
+      dragging = true;
+      resizer.classList.add('active');
+      e.preventDefault();
+    }, { passive: false });
+
+    document.addEventListener('touchmove', function (e) {
+      if (!dragging) return;
+      const touch = e.touches[0];
+      const rect = content.getBoundingClientRect();
+      const isMobile = window.innerWidth <= 768;
+      if (isMobile) {
+        const pct = ((touch.clientY - rect.top) / rect.height) * 100;
+        termPanel.style.flex = '0 0 ' + Math.max(20, Math.min(80, pct)) + '%';
+      } else {
+        const pct = ((touch.clientX - rect.left) / rect.width) * 100;
+        termPanel.style.flex = '0 0 ' + Math.max(20, Math.min(80, pct)) + '%';
+      }
+      fitAddon.fit();
+    }, { passive: true });
+
+    document.addEventListener('touchend', function () {
+      if (dragging) {
+        dragging = false;
+        resizer.classList.remove('active');
+      }
+    });
+  })();
+
+  // ── Status Bar ──
+  function updateClock() {
+    const now = new Date();
+    const time = now.toLocaleTimeString('en-US', {
+      timeZone: 'America/Monterrey',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
+    document.getElementById('clock').textContent = time;
+  }
+
+  async function pollGateway() {
+    const el = document.getElementById('gw-status');
+    try {
+      const res = await fetch('https://main.mghm.ai/health', { mode: 'cors', signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json().catch(function () { return {}; });
+        el.innerHTML = '<span class="dot green"></span>Gateway';
+        if (data.sessions !== undefined) {
+          document.getElementById('session-info').textContent = 'Sessions: ' + data.sessions;
+        }
+      } else {
+        el.innerHTML = '<span class="dot red"></span>Gateway';
+      }
+    } catch (_) {
+      el.innerHTML = '<span class="dot red"></span>Gateway';
+    }
+  }
+
+  async function pollOllama() {
+    const el = document.getElementById('mac-status');
+    const modelEl = document.getElementById('model-info');
+    try {
+      const res = await fetch('https://ollama.mghm.ai/api/tags', { mode: 'cors', signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        const data = await res.json();
+        el.innerHTML = '<span class="dot green"></span>Mac';
+        if (data.models && data.models.length > 0) {
+          const name = data.models[0].name || '--';
+          modelEl.textContent = 'Model: ' + name;
+        }
+      } else {
+        el.innerHTML = '<span class="dot red"></span>Mac';
+        modelEl.textContent = 'Model: --';
+      }
+    } catch (_) {
+      el.innerHTML = '<span class="dot red"></span>Mac';
+      modelEl.textContent = 'Model: --';
+    }
+  }
+
+  // Start polling
+  updateClock();
+  setInterval(updateClock, 1000);
+  pollGateway();
+  pollOllama();
+  setInterval(pollGateway, 30000);
+  setInterval(pollOllama, 30000);
+
+  // ── Boot ──
+  showBanner();
+  if (password) {
+    term.writeln('\x1b[38;2;102;102;119mRestoring session...\x1b[0m');
+    connectWS();
+  } else {
+    promptPassword();
+  }
+
+})();
+</script>
+</body>
+</html>
